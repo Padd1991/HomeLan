@@ -13,6 +13,7 @@ services:
     environment:
       PANEL_PUERTO: "8080"        # cambialo si el 8080 esta ocupado / change it if 8080 is taken
       TZ: "Europe/Madrid"         # tu zona horaria / your time zone
+      # PANEL_HOSTS: "panel-red.lan"   # mas opciones en el README / more options in the README
     volumes:
       - datos:/datos
     restart: unless-stopped

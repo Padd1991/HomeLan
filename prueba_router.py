@@ -20,7 +20,7 @@ import router as R  # noqa: E402
 
 R.CONF_ANTIGUA = os.path.join(N.DATOS, "no-existe.conf")
 CLAVE, NUMERO = "clave de prueba=1", "DJ8cggmF"
-ESTADO = {"dentro": False, "salidas": 0, "intentos": 0, "bloqueo": 0, "error": ""}
+ESTADO = {"dentro": False, "salidas": 0, "intentos": 0, "bloqueo": 0, "error": "", "solapes": 0}
 COOKIE = "_TESTCOOKIESUPPORT=1"
 
 
@@ -75,6 +75,7 @@ class Falso(BaseHTTPRequestHandler):
         d = parse_qs(self.rfile.read(int(self.headers["Content-Length"])).decode())
         if tag == "login_entry":
             ESTADO["intentos"] += 1
+            ESTADO["solapes"] += ESTADO["dentro"]  # alguien entra con otra sesion aun abierta
             ok = d["Password"][0] == hashlib.sha256((CLAVE + NUMERO).encode()).hexdigest() and d["Username"][0] == "user"
             ESTADO["dentro"] = ok and COOKIE in self.headers.get("Cookie", "")  # sin la cookie de la portada no vale
             ESTADO["error"] = "" if ok else "Usuario o contraseña incorrecta"
@@ -99,6 +100,15 @@ assert datos["90:ca:fa:00:00:03"] == {"punto": "wifi5", "ip": "192.168.0.12", "h
                                       "rx": 24000, "modo": "11ac", "enlace": 496386}, datos["90:ca:fa:00:00:03"]
 assert datos["14:c1:9f:00:00:04"]["punto"] == "wifi24-2" and datos["14:c1:9f:00:00:04"]["rssi"] is None
 assert "no-es-mac" not in datos and len(datos) == 4
+
+# La web y la vigilancia a la vez: una sesion detras de otra, nunca dos abiertas en el router
+hilos = [threading.Thread(target=R.leer_router, args=(BUENA, IP)) for _ in range(4)]
+for h in hilos:
+    h.start()
+for h in hilos:
+    h.join()
+assert ESTADO["solapes"] == 0 and ESTADO["salidas"] == 5 and not ESTADO["dentro"], ESTADO
+ESTADO["intentos"] = 1
 
 # Clave mala: el router dice "recarga" igual, pero se detecta y es un solo intento
 try:
@@ -125,7 +135,8 @@ with open(antigua, "w") as f:
     f.write("# comentario\nusuario=user\nclave= a=b \n")
 R.CONF_ANTIGUA = antigua
 assert R.leer_credenciales() == {"tipo": "zte_f6600p", "usuario": "user", "clave": " a=b "}
-assert stat.S_IMODE(os.stat(R.ruta_credenciales()).st_mode) == 0o600
+if os.name != "nt":  # Windows no tiene permisos de Unix
+    assert stat.S_IMODE(os.stat(R.ruta_credenciales()).st_mode) == 0o600
 R.guardar_credenciales(None)
 R.CONF_ANTIGUA = os.path.join(N.DATOS, "no-existe.conf")
 assert R.leer_credenciales() is None
@@ -168,5 +179,6 @@ with closing(N.abrir()) as c, c:
     N.meta(c, "router_ip", IP)
 assert R.probar_y_guardar({**BUENA, "clave": "mala"}) == "clave" and R.leer_credenciales() is None
 assert R.probar_y_guardar(BUENA) == "" and R.leer_credenciales() == BUENA and R.ESTADO["estado"] == "ok"
+assert R._despertar == {"ya": True, "ok": True}  # la vigilancia deja su espera larga y sigue a ritmo normal
 srv.shutdown()
 print("Pruebas del router correctas")

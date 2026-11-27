@@ -38,6 +38,8 @@
   "bienvenida.titulo": "Bienvenido a HomeLan",
   "bienvenida.texto": "El panel ya está buscando los equipos de tu red. Antes de verlos, ponle nombre y una contraseña para que nadie más pueda entrar.",
   "bienvenida.nombre": "Nombre de tu red",
+  "bienvenida.codigo": "Código de instalación",
+  "bienvenida.codigo_ayuda": "Lo mostró el instalador al terminar. Si no lo tienes, está en el registro del panel: journalctl -u panel-red | grep 'setup code' o, con Docker, docker logs panel-red. Así nadie más de tu red puede poner la contraseña antes que tú.",
   "bienvenida.clave": "Contraseña del panel (mínimo 8 caracteres)",
   "bienvenida.clave2": "Repite la contraseña",
   "bienvenida.nota": "Guárdala bien: si la olvidas habrá que reinstalar el panel o borrar sus datos.",
@@ -177,6 +179,8 @@
   "aj.general": "General",
   "aj.nombre": "Nombre de la red",
   "aj.idioma_def": "Idioma por defecto",
+  "aj.red": "Red que se escanea: {rango}",
+  "aj.red_recortada": "Tu red ({red}) es demasiado grande para escanearla entera cada minuto: solo se escanea {rango}. Para elegir otros rangos, usa la variable PANEL_RED (está en el README).",
   "aj.router": "Router",
   "aj.router_ayuda": "Opcional. Con la contraseña de la web del router ({ip}), el panel sabe en qué boca o banda WiFi está cada equipo. Solo lee: entra, consulta y cierra la sesión cada 5 minutos. La contraseña se prueba antes de guardarla.",
   "aj.modelo": "Modelo",
@@ -224,5 +228,7 @@
   "error.clave_corta": "La contraseña debe tener al menos 8 caracteres.",
   "error.clave_mala": "Contraseña incorrecta.",
   "error.sin_conexion": "Sin conexión con el panel.",
-  "error.no_coinciden": "Las contraseñas no coinciden."
+  "error.no_coinciden": "Las contraseñas no coinciden.",
+  "error.interno": "Algo ha fallado en el panel. Vuelve a probar; si sigue, mira su registro.",
+  "error.codigo_malo": "El código de instalación no es ese. Míralo en el registro del panel."
 }

@@ -98,11 +98,13 @@ function verBienvenida() {
       ev.preventDefault();
       const f = Object.fromEntries(new FormData(ev.target));
       if (f.clave !== f.clave2) { err.textContent = t('error.no_coinciden'); return; }
-      const r = await api('configurar', { clave: f.clave, nombre: f.nombre, idioma: LANG });
+      const r = await api('configurar', { clave: f.clave, nombre: f.nombre, idioma: LANG, codigo: f.codigo });
       if (r.error === 'ya_configurado') { iniciar(); return; }  // otra pestaña se adelanto: a entrar
       if (r.error) { err.textContent = errorTxt(r.error); return; }
       st.primera = true; location.hash = '#ajustes'; iniciar();
     } },
+    h('label', {}, t('bienvenida.codigo'), h('input', { name: 'codigo', required: true, autocomplete: 'off', spellcheck: 'false', placeholder: 'ABCD-EFGH', maxlength: 12, class: 'mono' })),
+    h('p', { class: 'm' }, t('bienvenida.codigo_ayuda')),
     h('label', {}, t('bienvenida.nombre'), h('input', { name: 'nombre', maxlength: 40, value: t('nombre_defecto') })),
     h('label', {}, t('bienvenida.clave'), h('input', { name: 'clave', type: 'password', minlength: 8, required: true, autocomplete: 'new-password' })),
     h('label', {}, t('bienvenida.clave2'), h('input', { name: 'clave2', type: 'password', minlength: 8, required: true, autocomplete: 'new-password' })),
@@ -324,6 +326,7 @@ function formulario(e) {
     h('form', { onsubmit: async (ev) => {
       ev.preventDefault();
       const d = Object.fromEntries(new FormData(ev.target)); d.mac = e.mac;
+      if (d.boca === etBoca(e.boca)) d.boca = e.boca;  // sin tocar: se guarda el codigo (wifi5), no su texto traducido
       const r = await api('equipo', d);
       if (r.error) { err.textContent = errorTxt(r.error); return; }
       st.editando = false; st.msg = t('guardado'); await cargar(); repintar();
@@ -401,6 +404,13 @@ function verHistorial() {
 }
 
 // ---------------------------------------------------------------- ajustes
+// Se repinta sola cada 15 s aunque el resto de Ajustes no (se perderia lo escrito en los formularios).
+function estadoRouter() {
+  const ro = st.d.router;
+  const txt = ro.estado === 'ok' ? t('aj.router_ok', { n: ro.msg, cuando: hace(ro.ts) }) : t('aj.router_' + ro.estado, { msg: ro.msg });
+  return [h('span', { class: 'led ' + (ro.estado === 'ok' ? 'on' : ro.estado === 'sin_configurar' ? '' : 'av'), 'aria-hidden': 'true' }), txt];
+}
+
 function verAjustes() {
   const A = st.aj;
   if (!A) { cargarAjustes(); return [h('section', { class: 'card' }, h('p', { class: 's' }, t('cargando')))]; }
@@ -418,7 +428,9 @@ function verAjustes() {
   const g = msg(), fg = h('form', { onsubmit: (ev) => { ev.preventDefault(); enviar('ajustes', datosDe(fg), g); } },
     h('label', {}, t('aj.nombre'), h('input', { name: 'nombre', maxlength: 40, value: A.nombre })),
     h('label', {}, t('aj.idioma_def'), sel('idioma', [['es', 'Español'], ['en', 'English']], A.idioma || LANG)),
-    h('div', { class: 'pie' }, h('button', { class: 'pill pri' }, t('guardar')), g));
+    h('div', { class: 'pie' }, h('button', { class: 'pill pri' }, t('guardar')), g),
+    A.escaneo.red ? h('p', { class: 's est' }, h('span', { class: 'led av', 'aria-hidden': 'true' }), t('aj.red_recortada', { red: A.escaneo.red, rango: A.escaneo.rango }))
+      : A.escaneo.rango ? h('p', { class: 'm' }, t('aj.red', { rango: A.escaneo.rango })) : null);
   // Contraseña del panel
   const c = msg(), fc = h('form', { onsubmit: async (ev) => {
     ev.preventDefault();
@@ -432,8 +444,7 @@ function verAjustes() {
   h('label', {}, t('aj.clave_nueva2'), h('input', { name: 'nueva2', type: 'password', minlength: 8, required: true, autocomplete: 'new-password' })),
   h('div', { class: 'pie' }, h('button', { class: 'pill pri' }, t('aj.cambiar_clave')), c));
   // Router
-  const r = msg(), ro = st.d.router;
-  const estadoRouter = ro.estado === 'ok' ? t('aj.router_ok', { n: ro.msg, cuando: hace(ro.ts) }) : t('aj.router_' + ro.estado, { msg: ro.msg });
+  const r = msg();
   const fr = h('form', { onsubmit: async (ev) => {
     ev.preventDefault();
     const d = datosDe(fr);
@@ -444,7 +455,7 @@ function verAjustes() {
   h('label', {}, t('aj.modelo'), sel('tipo', [['', t('aj.ninguno')]].concat(Object.entries(A.modelos)), A.router.tipo)),
   h('label', {}, t('aj.usuario'), h('input', { name: 'usuario', maxlength: 60, value: A.router.usuario, autocomplete: 'off' })),
   h('label', {}, t('aj.clave_router'), h('input', { name: 'clave', type: 'password', autocomplete: 'off', placeholder: A.router.tipo ? t('aj.clave_otra_vez') : '' })),
-  h('p', { class: 's est' }, h('span', { class: 'led ' + (ro.estado === 'ok' ? 'on' : ro.estado === 'sin_configurar' ? '' : 'av'), 'aria-hidden': 'true' }), estadoRouter),
+  h('p', { class: 's est', id: 'estado-router' }, estadoRouter()),
   h('div', { class: 'pie' }, h('button', { class: 'pill pri' }, t('aj.probar_guardar')), r));
   // Que hay en cada boca del router
   const destinos = [['', t('aj.directo')]].concat(opcionesPadre('').filter(([id]) => id && id !== 'internet' && id !== st.d.router_mac));
@@ -479,11 +490,16 @@ function verAjustes() {
 const VISTAS = { resumen: verResumen, mapa: verMapa, equipos: verEquipos, historial: verHistorial, ajustes: verAjustes };
 const vista = () => (VISTAS[location.hash.slice(1)] ? location.hash.slice(1) : 'resumen');
 
+function pintarEscaneo() {
+  const s = st.d.ahora - st.d.ultimo;
+  if ($('escaneo')) $('escaneo').textContent = !st.d.ultimo ? t('esperando_escaneo') : t('ultimo_escaneo', { cuando: s < 90 ? t('hace_s', { n: Math.max(0, s) }) : t('hace_min', { n: Math.round(s / 60) }) });
+}
+
 function repintar() {
   if (!st.d) return;
   pintarCabecera();
   const s = st.d.ahora - st.d.ultimo, viejo = !st.d.ultimo || s > 240;
-  $('escaneo').textContent = !st.d.ultimo ? t('esperando_escaneo') : t('ultimo_escaneo', { cuando: s < 90 ? t('hace_s', { n: Math.max(0, s) }) : t('hace_min', { n: Math.round(s / 60) }) });
+  pintarEscaneo();
   const ro = st.d.router;
   const rav = ro.estado === 'clave' ? t('aviso.router_clave') : ro.estado === 'error' ? t('aviso.router_error', { msg: ro.msg }) : '';
   const av = st.d.error || (viejo && st.d.ultimo ? t('aviso.sin_escaneos') : '') || rav;
@@ -510,7 +526,10 @@ async function cargar() {
   st.d = d;
   // No repintar mientras se escribe ni en ajustes: se perderia lo escrito.
   const act = document.activeElement;
-  if (!st.editando && !st.sobre && vista() !== 'ajustes' && !(act && act.matches('input,select'))) repintar();
+  if (!st.editando && !st.sobre && vista() !== 'ajustes' && !(act && act.matches('input,select'))) { repintar(); return; }
+  // Sin repintar todo, al menos lo que cambia solo: la hora del ultimo escaneo y el estado del router.
+  pintarEscaneo();
+  if ($('estado-router')) $('estado-router').replaceChildren(...estadoRouter());
 }
 
 let reloj = null;

@@ -36,9 +36,22 @@ jobs:
       - run: shellcheck -S warning instalar.sh proxmox-lxc.sh empaquetar.sh
       - name: instalar.sh en Ubuntu
         run: |
-          sudo PANEL_PUERTO=8081 ./instalar.sh
+          set -o pipefail
+          sudo PANEL_PUERTO=8081 ./instalar.sh | tee salida.txt
+          grep -q 'Setup code: [A-Z0-9]\{4\}-[A-Z0-9]\{4\}' salida.txt
           curl -fsS http://127.0.0.1:8081/api/sesion
+          # Con el servicio endurecido (seccomp, familias de socket), arp-scan tiene que poder escanear
+          R=""
+          for _ in $(seq 90); do
+            R=$(sudo python3 -I -c "import sqlite3; m=dict(sqlite3.connect('/var/lib/panel-red/red.db').execute('SELECT clave, valor FROM meta')); print('escaneo correcto' if m.get('ultimo') else m.get('error') or '')")
+            [ -n "$R" ] && break
+            sleep 2
+          done
+          echo "Primer escaneo: ${R:-sin terminar}"
+          sudo journalctl -u panel-red --no-pager | tail -20
+          case "$R" in *"not permitted"*|*"Permission denied"*|*"Bad system call"*) exit 1 ;; esac
           sudo ./instalar.sh --desinstalar --borrar-datos
+          if id panelred 2>/dev/null; then echo 'el usuario panelred sigue'; exit 1; fi
 
   docker:
     name: Docker (amd64, arm64, armv7)
