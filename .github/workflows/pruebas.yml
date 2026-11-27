@@ -1,0 +1,73 @@
+# Pruebas en cada cambio y paquete para descargar en cada versión (etiqueta v1.0, v1.1...).
+# Tests on every change, and a downloadable package for every version tag.
+name: pruebas
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    container: python:${{ matrix.python }}-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.11", "3.13"]
+    env:
+      LC_ALL: C.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -I prueba.py
+      - run: python3 -I prueba_router.py
+      - run: python3 -I prueba_web.py
+
+  scripts:
+    name: Scripts de shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -S warning instalar.sh proxmox-lxc.sh empaquetar.sh
+      - name: instalar.sh en Ubuntu
+        run: |
+          sudo PANEL_PUERTO=8081 ./instalar.sh
+          curl -fsS http://127.0.0.1:8081/api/sesion
+          sudo ./instalar.sh --desinstalar --borrar-datos
+
+  docker:
+    name: Docker (amd64, arm64, armv7)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Arranca y responde
+        run: |
+          docker build -t panel-red:ci .
+          docker run -d --name panel --network host --cap-add NET_RAW -e PANEL_PUERTO=8082 panel-red:ci
+          for i in $(seq 30); do curl -fsS http://127.0.0.1:8082/api/sesion && exit 0; sleep 1; done
+          docker logs panel; exit 1
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Se construye en ARM (Raspberry Pi)
+        run: docker buildx build --platform linux/arm64,linux/arm/v7 .
+
+  version:
+    name: Paquete de la versión
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [python, scripts, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Crea la versión con el paquete
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git archive --format=tar.gz --prefix=panel-red/ -o "panel-red-$GITHUB_REF_NAME.tar.gz" HEAD
+          gh release create "$GITHUB_REF_NAME" "panel-red-$GITHUB_REF_NAME.tar.gz" --generate-notes

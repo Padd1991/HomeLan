@@ -1,0 +1,21 @@
+# HomeLan: panel de red / network panel
+#   docker compose up -d --build      y abre / then open  http://IP-DE-ESTE-EQUIPO:8080
+services:
+  panel-red:
+    build: .
+    image: panel-red:local
+    container_name: panel-red
+    # Imprescindible: el panel tiene que ver la red de casa (ARP) y el router (UPnP).
+    # Required: the panel must see the home network (ARP) and the router (UPnP).
+    network_mode: host
+    cap_add:
+      - NET_RAW
+    environment:
+      PANEL_PUERTO: "8080"        # cambialo si el 8080 esta ocupado / change it if 8080 is taken
+      TZ: "Europe/Madrid"         # tu zona horaria / your time zone
+    volumes:
+      - datos:/datos
+    restart: unless-stopped
+
+volumes:
+  datos:
