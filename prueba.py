@@ -1,11 +1,13 @@
 """Pruebas de presencia, medidor, trafico y migracion. Base de datos en carpeta temporal; no toca la red."""
 import atexit
+import ipaddress
 import json
 import os
 import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 
 os.environ["PANEL_DATOS"] = tempfile.mkdtemp(prefix="prueba-panel-")
 atexit.register(shutil.rmtree, os.environ["PANEL_DATOS"], True)
@@ -105,6 +107,14 @@ m.muestra(0, 5, 10)
 assert m.muestra(10, 5, 12) == (0, 10)
 assert m.muestra(20, 5, 500) is None and m.aviso == "parado"
 assert m.muestra(30, 1005, 510) == (1000, 10) and m.aviso == ""
+# Contador de 64 bits (por encima de 2^32): se mide, no es un tope; y cruzar 2^32 no es una vuelta
+m = red.Medidor()
+m.muestra(0, 5 * 10 ** 12, 10)
+assert m.muestra(10, 5 * 10 ** 12 + 12_500_000, 20) == (12_500_000, 10) and m.aviso == ""
+m = red.Medidor()
+m.muestra(0, TOPE - 1000, 10)
+assert m.muestra(10, TOPE + 4001, 20) == (5001, 10) and m.aviso == ""
+assert m.muestra(20, 100, 30) is None  # el router se reinicia: no se inventa una bajada enorme
 
 # Descripcion UPnP: encuentra el contador aunque venga con espacio de nombres y URLBase
 xml = b"""<?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0"><URLBase>http://192.168.1.1:5000/</URLBase>
@@ -203,4 +213,76 @@ for malo in (b"", b"\0" * 12, b"\0\0\0\0\0\1\0\0\0\0\0\0\xc0\x0c\0\1\0\1"):
         red.ptr_de(malo)
     except (IndexError, red.struct.error, UnicodeError):
         pass
+
+# Version 4: bocas WiFi guardadas con su texto traducido vuelven a ser codigos; lo escrito a mano no se toca
+v3 = memoria()
+for mac, boca in (("02:00:00:00:01:01", "WiFi 5 GHz"), ("02:00:00:00:01:02", "WiFi 2.4 GHz (network 2)"),
+                  ("02:00:00:00:01:03", "WiFi 2,4 GHz"), ("02:00:00:00:01:04", "WiFi del salon")):
+    v3.execute("INSERT INTO equipos(mac,ip,medio,boca) VALUES(?,?,'wifi',?)", (mac, "10.0.0.2", boca))
+N.meta(v3, "esquema", 3)
+N.migrar(v3)
+assert [r["boca"] for r in v3.execute("SELECT boca FROM equipos ORDER BY mac")] == ["wifi5", "wifi24-2", "wifi24", "WiFi del salon"]
+assert N.meta(v3, "esquema") == "4"
+
+# Olvido: sin identificar y sin verse 30 dias se borra; lo identificado, lo conectado y aquello de lo que algo cuelga, no
+o = memoria()
+ahora, viejo = 100_000_000, 100_000_000 - red.OLVIDO - 1
+for mac, conocido, online, visto, padre in (("02:00:00:00:00:01", 0, 0, viejo, ""),         # se olvida
+                                             ("02:00:00:00:00:02", 1, 0, viejo, ""),         # identificado
+                                             ("02:00:00:00:00:03", 0, 1, viejo, ""),         # conectado
+                                             ("02:00:00:00:00:04", 0, 0, ahora - 3600, ""),  # visto hace poco
+                                             ("02:00:00:00:00:05", 0, 0, viejo, ""),         # cuelga algo de el
+                                             ("02:00:00:00:00:06", 0, 0, viejo, "02:00:00:00:00:05"),  # se olvida
+                                             ("02:00:00:00:00:07", 0, 0, viejo, ""),         # esta en una boca
+                                             ("02:00:00:00:00:08", 0, 0, viejo, "internet")):  # el router
+    o.execute("INSERT INTO equipos(mac,ip,conocido,online,visto_1,visto_n,padre) VALUES(?,?,?,?,?,?,?)",
+              (mac, "10.0.0.1", conocido, online, visto, visto, padre))
+    o.execute("INSERT INTO sesiones(mac,ip,inicio,fin,abierta) VALUES(?,?,?,?,0)", (mac, "10.0.0.1", visto, visto))
+    N.evento(o, visto, "nuevo", mac, "10.0.0.1")
+N.meta_json(o, "bocas", valor={"LAN2": "02:00:00:00:00:07"})
+N.meta(o, "router_mac", "02:00:00:00:00:08")
+assert red.olvidar(o, ahora) == 2
+quedan = {r["mac"][-1] for r in o.execute("SELECT mac FROM equipos")}
+assert quedan == set("234578"), quedan
+assert {r["mac"][-1] for r in o.execute("SELECT DISTINCT mac FROM sesiones")} == quedan
+assert o.execute("SELECT COUNT(*) n FROM eventos").fetchone()["n"] == 8  # los avisos se conservan
+assert red.olvidar(o, ahora) == 1  # al dia siguiente, el 5: ya no cuelga nada de el
+assert red.olvidar(o, ahora) == 0
+
+# Que se escanea: la red entera si cabe; si es mayor que /22, el /22 de este equipo y el router; o lo de PANEL_RED
+IF = ipaddress.IPv4Interface
+assert red.objetivos(IF("192.168.1.5/24"), "192.168.1.1") == (["--localnet"], "192.168.1.0/24", False)
+assert red.objetivos(None, "192.168.1.1") == (["--localnet"], "", False)
+assert red.objetivos(IF("10.0.5.20/16"), "10.0.0.1") == (["10.0.4.0/22", "10.0.0.1"], "10.0.4.0/22, 10.0.0.1", True)
+assert red.objetivos(IF("10.0.1.20/16"), "10.0.0.1") == (["10.0.0.0/22"], "10.0.0.0/22", True)  # el router ya esta dentro
+assert red.objetivos(IF("10.0.5.20/16"), "10.0.0.1", "10.0.0.0/23, 10.0.8.0/24")[:2] == (["10.0.0.0/23", "10.0.8.0/24"], "10.0.0.0/23, 10.0.8.0/24")
+for malo in ("10.0.0.0/16", "basura", " , "):
+    try:
+        red.objetivos(IF("10.0.5.20/16"), "10.0.0.1", malo)
+        raise AssertionError(malo)
+    except RuntimeError as ex:
+        assert "PANEL_RED" in str(ex)
+
+# DNS inverso: activo salvo PANEL_DNS=0
+os.environ["PANEL_DNS"] = "0"
+assert not red.dns_inverso_activo()
+del os.environ["PANEL_DNS"]
+assert red.dns_inverso_activo()
+
+# Reloj hacia atras (Raspberry sin pila al ponerse en hora): una sesion nunca acaba antes de empezar
+rl = memoria()
+red.aplicar(rl, [("10.0.0.2", A, "")], 50_000)
+red.aplicar(rl, [("10.0.0.2", A, "")], 49_000)
+s = rl.execute("SELECT inicio, fin FROM sesiones WHERE mac=?", (A,)).fetchone()
+assert s["fin"] >= s["inicio"], dict(s)
+
+# Esperar a la hora: sin timesyncd no espera; con el reloj ya en hora tampoco; sin sincronizar, hasta el maximo
+hora = tempfile.mkdtemp(dir=N.DATOS)
+assert N.esperar_hora(os.path.join(hora, "no-existe"), 60)
+inicio = time.monotonic()
+N.log.disabled = True  # su aviso de "sigue sin hora" es lo esperado aqui
+assert not N.esperar_hora(hora, 0.2) and time.monotonic() - inicio < 5
+N.log.disabled = False
+open(os.path.join(hora, "synchronized"), "w").close()
+assert N.esperar_hora(hora, 60)
 print("Pruebas correctas")

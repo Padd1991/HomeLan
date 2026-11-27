@@ -8,6 +8,7 @@ import http.cookiejar
 import json
 import os
 import re
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -219,8 +220,11 @@ class ZTE:
 CLASES = {"zte_f6600p": ZTE}
 
 
+_en_uso = threading.Lock()  # una sola sesion a la vez: la web y la vigilancia no deben pisarse en el router
+
+
 def leer_router(cred, ip):
-    with CLASES[cred["tipo"]](cred["usuario"], cred["clave"], f"http://{ip}") as r:
+    with _en_uso, CLASES[cred["tipo"]](cred["usuario"], cred["clave"], f"http://{ip}") as r:
         return r.leer()
 
 
@@ -257,7 +261,7 @@ def aplicar_router(c, datos, ahora):
                   (punto, d.get("rssi"), d.get("tx"), d.get("rx"), d.get("modo", ""), ahora, d.get("host", ""), mac))
         ab = c.execute("SELECT * FROM puntos WHERE mac=? AND abierta=1 ORDER BY id DESC LIMIT 1", (mac,)).fetchone()
         if ab and ab["punto"] == punto and ahora - ab["fin"] <= margen:
-            c.execute("UPDATE puntos SET fin=? WHERE id=?", (ahora, ab["id"]))
+            c.execute("UPDATE puntos SET fin=MAX(?, inicio) WHERE id=?", (ahora, ab["id"]))  # reloj hacia atras
         else:
             c.execute("UPDATE puntos SET abierta=0 WHERE mac=? AND abierta=1", (mac,))
             c.execute("INSERT INTO puntos(mac,punto,inicio,fin) VALUES(?,?,?,?)", (mac, punto, ahora, ahora))
@@ -277,7 +281,7 @@ def recolocar(c):
 
 ESTADO = {"estado": "sin_configurar", "ts": 0, "msg": ""}
 _rechazada = {"huella": None}
-_despertar = {"ya": False}
+_despertar = {"ya": False, "ok": False}  # ok: la web acaba de leer el router con datos nuevos
 
 
 def probar_y_guardar(cred):
@@ -300,12 +304,18 @@ def probar_y_guardar(cred):
         aplicar_router(c, datos, int(time.time()))
     ESTADO.update(estado="ok", ts=time.time(), msg=str(len(datos)))
     _rechazada["huella"] = None
+    _despertar.update(ok=True, ya=True)  # la vigilancia deja su espera larga y sigue a ritmo normal desde aqui
     return ""
 
 
 def vigilar():
     espera = PERIODO
     while True:
+        if _despertar["ok"]:
+            _despertar["ok"] = False
+            espera = PERIODO
+            _dormir(PERIODO)
+            continue
         cred = leer_credenciales()
         if not cred:
             ESTADO.update(estado="sin_configurar", msg="")
@@ -318,7 +328,6 @@ def vigilar():
             with closing(N.abrir()) as c:
                 ip = N.meta(c, "router_ip")
             if not ip:  # el escaner aun no ha encontrado el router: se espera sin alargar los reintentos
-                ESTADO.update(estado="sin_configurar" if ESTADO["estado"] == "sin_configurar" else ESTADO["estado"])
                 _dormir(20)
                 continue
             datos = leer_router(cred, ip)

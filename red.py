@@ -17,6 +17,9 @@ INTERVALO = 60        # segundos entre escaneos
 GRACIA = 900          # sin responder este tiempo = desconectado (los moviles dormidos callan un rato)
 MUESTREO = 10         # segundos entre lecturas del contador de internet
 MAX_HUECO = 30        # con mas tiempo entre lecturas, el contador puede haber dado mas de una vuelta
+OLVIDO = 30 * 86400   # sin identificar y sin verse este tiempo: se olvida (moviles con MAC privada que cambia)
+MAX_PREFIJO = 22      # redes mas grandes (mas de 1024 direcciones) no se escanean enteras: no daria tiempo
+MAX_DIRECCIONES = 2048  # tope para los rangos de PANEL_RED: con 3 reintentos son unos 6000 paquetes, ~20 s
 VUELTA = 2 ** 32
 MAX_BPS = VUELTA * 8 / MUESTREO * 0.95  # por encima, una vuelta de contador seria indistinguible
 log = N.log
@@ -55,6 +58,15 @@ def ruta_defecto():
     return gw, os.environ.get("PANEL_IFACE") or dev
 
 
+def direccion(dev):
+    """IP y mascara de esta maquina en esa interfaz (IPv4Interface), o None si no se sabe."""
+    try:
+        sal = subprocess.run(["ip", "-4", "-o", "addr", "show", dev], capture_output=True, text=True, timeout=5).stdout
+        return ipaddress.IPv4Interface(re.search(r"inet ([\d.]+/\d+)", sal).group(1))
+    except (OSError, AttributeError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def propio(dev, gw=None):
     """IP y MAC de esta maquina en esa interfaz (arp-scan no se ve a si mismo)."""
     try:
@@ -62,11 +74,9 @@ def propio(dev, gw=None):
             mac = f.read().strip().lower()
     except (OSError, TypeError):
         return None
-    try:
-        sal = subprocess.run(["ip", "-4", "-o", "addr", "show", dev], capture_output=True, text=True, timeout=5).stdout
-        return re.search(r"inet ([\d.]+)/", sal).group(1), mac
-    except (OSError, AttributeError, subprocess.SubprocessError):
-        pass
+    d = direccion(dev)
+    if d:
+        return str(d.ip), mac
     if gw:  # sin el comando ip: la IP de origen con la que se llega al router
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -99,8 +109,36 @@ def leer_arp(salida):
     return res
 
 
-def escanear(dev):
-    r = subprocess.run(["arp-scan", f"--interface={dev}", "--localnet", "--plain", "--retry=3"],
+def objetivos(iface, gw, pedido=""):
+    """Que escanea arp-scan: (argumentos, rango que se muestra en Ajustes, si se ha recortado la red).
+
+    Una red mayor de /22 no da tiempo a escanearla entera en cada pasada (un /16 son 65 000 direcciones):
+    se escanea el /22 de este equipo, mas el router si queda fuera. PANEL_RED elige los rangos a mano.
+    """
+    if pedido:
+        try:
+            redes = [ipaddress.IPv4Network(x.strip(), strict=False) for x in pedido.split(",") if x.strip()]
+        except ValueError as ex:
+            raise RuntimeError(f"PANEL_RED no valido: {ex}") from None
+        if not redes or sum(r.num_addresses for r in redes) > MAX_DIRECCIONES:
+            raise RuntimeError(f"PANEL_RED: entre 1 y {MAX_DIRECCIONES} direcciones en total")
+        return [str(r) for r in redes], ", ".join(str(r) for r in redes), False
+    if iface is None:
+        return ["--localnet"], "", False
+    if iface.network.prefixlen >= MAX_PREFIJO:
+        return ["--localnet"], str(iface.network), False
+    trozo = ipaddress.IPv4Network(f"{iface.ip}/{MAX_PREFIJO}", strict=False)
+    extra = [gw] if gw and ipaddress.IPv4Address(gw) not in trozo else []
+    return [str(trozo)] + extra, ", ".join([str(trozo)] + extra), True
+
+
+def escanear(dev, gw=None):
+    iface = direccion(dev)
+    args, rango, recortado = objetivos(iface, gw, os.environ.get("PANEL_RED", ""))
+    if recortado and ESTADO_ESCANER["rango"] != rango:
+        log.warning("la red %s es mayor que /%s: solo se escanea %s (se cambia con PANEL_RED)", iface.network, MAX_PREFIJO, rango)
+    ESTADO_ESCANER.update(rango=rango, red=str(iface.network) if recortado else "")
+    r = subprocess.run(["arp-scan", f"--interface={dev}", "--plain", "--retry=3", *args],
                        capture_output=True, text=True, timeout=50)
     res = leer_arp(r.stdout)
     if r.returncode != 0 or not res:
@@ -138,7 +176,8 @@ def aplicar(c, encontrados, ahora, defectos=None):
             hueco = ahora - e["visto_n"]
             ab = c.execute("SELECT * FROM sesiones WHERE mac=? AND abierta=1 ORDER BY id DESC LIMIT 1", (mac,)).fetchone()
             if ab and hueco <= GRACIA and ab["ip"] == ip:
-                c.execute("UPDATE sesiones SET fin=? WHERE id=?", (ahora, ab["id"]))
+                # MAX: si el reloj va hacia atras (una Raspberry sin pila al ponerse en hora), fin nunca queda antes que inicio
+                c.execute("UPDATE sesiones SET fin=MAX(?, inicio) WHERE id=?", (ahora, ab["id"]))
             else:
                 # Cambio de IP, vuelta tras ausencia o escaner parado: empieza una sesion nueva.
                 c.execute("UPDATE sesiones SET abierta=0 WHERE mac=? AND abierta=1", (mac,))
@@ -162,7 +201,22 @@ def aplicar(c, encontrados, ahora, defectos=None):
     N.meta(c, "error", "")
 
 
-ESTADO_ESCANER = {"gw": None, "dev": None}
+def olvidar(c, ahora):
+    """Borra los equipos sin identificar que llevan OLVIDO sin verse, salvo si algo cuelga de ellos.
+
+    Sin esto, cada MAC privada nueva de un movil se queda para siempre en la lista. Sus avisos se conservan.
+    """
+    usados = {r[0] for r in c.execute("SELECT padre FROM equipos UNION SELECT padre FROM nodos")}
+    usados |= set(N.meta_json(c, "bocas", {}).values()) | {N.meta(c, "router_mac"), N.meta(c, "yo")}
+    viejos = [r["mac"] for r in c.execute("SELECT mac FROM equipos WHERE conocido=0 AND online=0 AND visto_n<?",
+                                          (ahora - OLVIDO,)) if r["mac"] not in usados]
+    for mac in viejos:
+        for tabla in ("equipos", "sesiones", "puntos"):
+            c.execute(f"DELETE FROM {tabla} WHERE mac=?", (mac,))
+    return len(viejos)
+
+
+ESTADO_ESCANER = {"gw": None, "dev": None, "rango": "", "red": ""}  # red: la red entera, si no se escanea toda
 
 
 def bucle():
@@ -174,7 +228,7 @@ def bucle():
             if not dev:
                 raise RuntimeError("sin ruta por defecto")
             ESTADO_ESCANER.update(gw=gw, dev=dev)
-            res = escanear(dev)
+            res = escanear(dev, gw)
             defectos = {}
             yo = propio(dev, gw)
             if yo:
@@ -195,6 +249,9 @@ def bucle():
                         extra = " AND abierta=0" if tabla in ("sesiones", "puntos") else ""
                         c.execute(f"DELETE FROM {tabla} WHERE {col}<?{extra}", (t0 - N.RETENCION,))
                     c.execute("DELETE FROM web_sesiones WHERE caduca<?", (int(t0),))
+                    n = olvidar(c, int(t0))
+                    if n:
+                        log.info("olvidados %s equipos sin identificar que no se ven desde hace %s dias", n, OLVIDO // 86400)
                     ultima_limpieza = t0
         except Exception as ex:
             # Un escaneo fallido no debe dar a nadie por desconectado.
@@ -265,15 +322,23 @@ def ptr_de(d):
     return ""
 
 
+def dns_inverso_activo():
+    """El DNS inverso pregunta al servidor DNS del equipo (casi siempre el router), que puede reenviarlo fuera."""
+    return os.environ.get("PANEL_DNS", "1").strip().lower() not in ("0", "no", "off", "false")
+
+
 def buscar_nombres():
     """Completa el nombre de red de los equipos conectados, cada 6 horas como mucho."""
+    dns = dns_inverso_activo()
+    if not dns:
+        log.info("DNS inverso desactivado (PANEL_DNS=0): los nombres solo se buscan por mDNS, dentro de casa")
     while True:
         try:
             with closing(N.abrir()) as c:
                 pend = c.execute("SELECT mac, ip FROM equipos WHERE online=1 AND host_ts<?", (int(time.time()) - 21600,)).fetchall()
             for r in pend:
                 host = mdns_inverso(r["ip"])
-                if not host:
+                if not host and dns:
                     try:
                         host = socket.gethostbyaddr(r["ip"])[0].split(".")[0][:60]
                     except OSError:
@@ -353,11 +418,14 @@ class Medidor:
             return None
         t0, b0, p0 = self.prev
         dt = t - t0
-        if b >= VUELTA - 1 and dt <= MAX_HUECO:
+        tope = b == VUELTA - 1
+        if tope and dt <= MAX_HUECO:
             return None  # valor tope: suele durar un instante antes de dar la vuelta
-        d, dp = (b - b0) % VUELTA, p - p0
+        # Hay routers que dan el contador en 64 bits aunque UPnP lo defina de 32: por encima de 2^32 no es un tope.
+        ancho = VUELTA if max(b, b0) < VUELTA else 2 ** 64
+        d, dp = (b - b0) % ancho, p - p0
         self.prev = (t, b, p)
-        if b >= VUELTA - 1:
+        if tope:
             self.aviso = "tope"
         elif d == 0 and dp > 50:
             self.aviso = "parado"

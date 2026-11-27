@@ -1,6 +1,7 @@
 """Servidor web del panel: pagina, API, contraseña de acceso y ajustes."""
 import hashlib
 import hmac
+import html
 import ipaddress
 import json
 import os
@@ -27,13 +28,16 @@ COOKIE = "panel_sesion"
 MIN_CLAVE = 8
 TAILSCALE = ipaddress.ip_network("100.64.0.0/10")
 _fallos, _fallos_lock = {}, threading.Lock()
+# Cada scrypt usa 16 MB: sin limite, unas pocas peticiones a la vez agotarian la memoria del servicio (200 MB).
+_scrypt = threading.BoundedSemaphore(2)
 
 
 # ---------------------------------------------------------------- contraseña y sesiones
 
 def hash_clave(clave, sal=None):
     sal = sal or secrets.token_bytes(16)
-    h = hashlib.scrypt(clave.encode(), salt=sal, n=2 ** 14, r=8, p=1, dklen=32)
+    with _scrypt:
+        h = hashlib.scrypt(clave.encode(), salt=sal, n=2 ** 14, r=8, p=1, dklen=32)
     return f"scrypt${sal.hex()}${h.hex()}"
 
 
@@ -54,9 +58,38 @@ def bloqueado(ip):
 def anotar_fallo(ip):
     """Tras 5 fallos seguidos se espera 1 minuto, y el doble con cada fallo mas (hasta 15 min)."""
     with _fallos_lock:
+        if len(_fallos) > 1000:  # que no crezca sin fin: se olvidan las IP ya sin bloqueo
+            ahora = time.time()
+            for k in [k for k, (_, hasta) in _fallos.items() if hasta <= ahora]:
+                del _fallos[k]
         n, _ = _fallos.get(ip, (0, 0))
         n += 1
         _fallos[ip] = (n, time.time() + min(900, 60 * 2 ** (n - 5)) if n >= 5 else 0)
+
+
+ALFABETO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # sin 0/O ni 1/I: se copia a mano desde la consola
+_codigo = {"v": ""}
+
+
+def preparar_codigo():
+    """Mientras no haya contraseña, ponerla pide un codigo que solo sale en el registro del servicio.
+
+    Asi nadie mas de la red puede adelantarse y quedarse con el panel: hace falta acceso al equipo.
+    """
+    with closing(N.abrir()) as c:
+        if N.meta(c, "clave"):
+            return ""
+    if not _codigo["v"]:
+        _codigo["v"] = "".join(secrets.choice(ALFABETO) for _ in range(8))
+    v = _codigo["v"]
+    N.log.info("codigo para la primera vez / setup code: %s-%s", v[:4], v[4:])
+    return v
+
+
+def codigo_correcto(dado):
+    v = _codigo["v"]
+    dado = re.sub(r"[\s-]", "", str(dado or "")).upper()
+    return bool(v) and hmac.compare_digest(dado.encode(), v.encode())
 
 
 def crear_sesion(c):
@@ -76,6 +109,22 @@ def nombres_propios():
 
 
 HOSTS = nombres_propios()
+
+
+def pagina_prohibida(host, red_ok):
+    """Pagina 403 en los dos idiomas: por que no se abre y como arreglarlo."""
+    if red_ok:  # nombre no reconocido: lo normal es que el router le de un nombre propio (panel-red.lan, .home...)
+        h = html.escape(host[:100] or "?")
+        es = (f"Este panel no se abre con el nombre <b>{h}</b>. Ábrelo por su IP, o añade ese nombre a la variable "
+              f"<code>PANEL_HOSTS</code> (por ejemplo <code>PANEL_HOSTS={h}</code>) y reinicia el panel. Está en el README.")
+        en = (f"This panel does not open as <b>{h}</b>. Open it by its IP address, or add that name to the "
+              f"<code>PANEL_HOSTS</code> variable (for example <code>PANEL_HOSTS={h}</code>) and restart the panel. See the README.")
+    else:
+        es = "Este panel solo se abre desde la red de casa (o Tailscale)."
+        en = "This panel only opens from the home network (or Tailscale)."
+    return ('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>HomeLan</title><body style="font:16px/1.5 system-ui,sans-serif;max-width:40em;margin:3em auto;padding:0 1em">'
+            f'<h1 style="font-size:1.4em">HomeLan</h1><p lang="es">{es}</p><p lang="en">{en}</p></body>').encode()
 
 
 def texto(d, k, maximo=60):
@@ -119,7 +168,8 @@ def ajustes():
         return {"idioma": N.meta(c, "idioma") or "", "nombre": N.meta(c, "nombre") or "",
                 "modelos": R.MODELOS, "router_ip": N.meta(c, "router_ip") or "",
                 "router": {"tipo": cred["tipo"] if cred else "", "usuario": cred["usuario"] if cred else ""},
-                "bocas": N.meta_json(c, "bocas", {}), "bocas_vistas": vistas}
+                "bocas": N.meta_json(c, "bocas", {}), "bocas_vistas": vistas,
+                "escaneo": {"rango": red.ESTADO_ESCANER["rango"], "red": red.ESTADO_ESCANER["red"]}}
 
 
 # ---------------------------------------------------------------- cambios desde la web
@@ -127,7 +177,8 @@ def ajustes():
 def guardar_equipo(d):
     mac = str(d.get("mac", "")).lower()
     with closing(N.abrir()) as c, c:
-        if not N.MAC_RE.match(mac) or not c.execute("SELECT 1 FROM equipos WHERE mac=?", (mac,)).fetchone():
+        e = c.execute("SELECT padre, medio, boca, auto FROM equipos WHERE mac=?", (mac,)).fetchone() if N.MAC_RE.match(mac) else None
+        if e is None:
             return "no_existe"
         tipo, padre, medio = (str(d.get(k, "")) for k in ("tipo", "padre", "medio"))
         if tipo not in N.TIPOS or medio not in N.MEDIOS:
@@ -137,8 +188,11 @@ def guardar_equipo(d):
             return "padre_no_existe"
         if N.crea_bucle(padres, mac, padre):
             return "bucle"
-        c.execute("UPDATE equipos SET nombre=?, tipo=?, padre=?, medio=?, boca=?, conocido=1, auto=0 WHERE mac=?",
-                  (texto(d, "nombre", 40), tipo, padre, medio, texto(d, "boca", 40), mac))
+        boca = texto(d, "boca", 40)
+        # Solo deja de colocarse solo si se cambia a mano donde esta; ponerle nombre o tipo no cuenta.
+        auto = e["auto"] if (padre, medio, boca) == tuple(e[k] or "" for k in ("padre", "medio", "boca")) else 0
+        c.execute("UPDATE equipos SET nombre=?, tipo=?, padre=?, medio=?, boca=?, conocido=1, auto=? WHERE mac=?",
+                  (texto(d, "nombre", 40), tipo, padre, medio, boca, auto, mac))
     return ""
 
 
@@ -176,7 +230,7 @@ def guardar_bocas(d):
         padres = N.padres_validos(c)
         bocas = {}
         for k, v in d.items():
-            if not re.fullmatch(r"LAN\d|wifi", str(k)):
+            if not re.fullmatch(r"LAN\d|wifi", str(k)) or not isinstance(v, str):
                 return "no_valido"
             if v:
                 if v not in padres or v == "internet":
@@ -210,6 +264,7 @@ class Web(BaseHTTPRequestHandler):
         pass
 
     def responder(self, cod, cuerpo, tipo="application/json", cabeceras=()):
+        self._respondido = True
         if not isinstance(cuerpo, bytes):
             cuerpo = json.dumps(cuerpo, ensure_ascii=False).encode()
         self.send_response(cod)
@@ -237,9 +292,14 @@ class Web(BaseHTTPRequestHandler):
         except ValueError:
             host_ok = host in HOSTS
         cli = ipaddress.ip_address(self.ip())
-        if host_ok and (cli.is_private or cli.is_loopback or cli in TAILSCALE):
+        red_ok = cli.is_private or cli.is_loopback or cli in TAILSCALE
+        if host_ok and red_ok:
             return True
-        self.responder(403, {"error": "no_permitido"})
+        if self.command == "GET" and not urlparse(self.path).path.startswith("/api/"):
+            # Quien abre la pagina en el navegador ve que pasa, no un JSON pelado.
+            self.responder(403, pagina_prohibida(host, red_ok), "text/html")
+        else:
+            self.responder(403, {"error": "no_permitido"})
         return False
 
     def token(self):
@@ -261,6 +321,24 @@ class Web(BaseHTTPRequestHandler):
         return ("Set-Cookie", f"{COOKIE}={'' if borrar else token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={0 if borrar else SESION_S}")
 
     def do_GET(self):
+        self._atender(self._get)
+
+    def do_POST(self):
+        self._atender(self._post)
+
+    def _atender(self, f):
+        """Un error inesperado responde 500 en vez de cortar la conexion sin decir nada."""
+        self._respondido = False
+        try:
+            f()
+        except ConnectionError:
+            pass  # el navegador se fue a mitad
+        except Exception:
+            N.log.exception("web: %s %s", self.command, urlparse(self.path).path)
+            if not self._respondido:
+                self.responder(500, {"error": "interno"})
+
+    def _get(self):
         if not self.permitido():
             return
         u = urlparse(self.path)
@@ -290,7 +368,7 @@ class Web(BaseHTTPRequestHandler):
         except (KeyError, ValueError, OverflowError):
             self.responder(400, {"error": "no_valido"})
 
-    def do_POST(self):
+    def _post(self):
         if not self.permitido():
             return
         origen = urlparse(self.headers.get("Origin", "")).netloc.lower()
@@ -344,9 +422,13 @@ class Web(BaseHTTPRequestHandler):
                 # Solo la primera vez: despues hace falta la contraseña actual para cambiarla.
                 if guardada:
                     return self.responder(403, {"error": "ya_configurado"})
+                if not codigo_correcto(d.get("codigo")):
+                    anotar_fallo(ip)
+                    return self.responder(403, {"error": "codigo_malo"})
                 if len(clave) < MIN_CLAVE:
                     return self.responder(400, {"error": "clave_corta"})
                 N.meta(c, "clave", hash_clave(clave))
+                _codigo["v"] = ""
                 if d.get("idioma") in IDIOMAS:
                     N.meta(c, "idioma", d["idioma"])
                 N.meta(c, "nombre", texto(d, "nombre", 40))
@@ -376,4 +458,5 @@ class Web(BaseHTTPRequestHandler):
 
 
 def servir(puerto):
+    preparar_codigo()
     ThreadingHTTPServer(("0.0.0.0", puerto), Web).serve_forever()

@@ -38,6 +38,8 @@
   "bienvenida.titulo": "Welcome to HomeLan",
   "bienvenida.texto": "The panel is already looking for the devices on your network. Before you see them, give it a name and a password so nobody else can get in.",
   "bienvenida.nombre": "Name of your network",
+  "bienvenida.codigo": "Setup code",
+  "bienvenida.codigo_ayuda": "The installer showed it when it finished. If you don't have it, it is in the panel's log: journalctl -u panel-red | grep 'setup code' or, with Docker, docker logs panel-red. This way nobody else on your network can set the password before you.",
   "bienvenida.clave": "Panel password (at least 8 characters)",
   "bienvenida.clave2": "Repeat the password",
   "bienvenida.nota": "Keep it safe: if you forget it, you will have to reinstall the panel or delete its data.",
@@ -177,6 +179,8 @@
   "aj.general": "General",
   "aj.nombre": "Network name",
   "aj.idioma_def": "Default language",
+  "aj.red": "Network being scanned: {rango}",
+  "aj.red_recortada": "Your network ({red}) is too large to scan in full every minute: only {rango} is scanned. To choose other ranges, use the PANEL_RED variable (see the README).",
   "aj.router": "Router",
   "aj.router_ayuda": "Optional. With the password of the router's web page ({ip}), the panel knows which port or WiFi band each device uses. Read only: it logs in, reads and logs out every 5 minutes. The password is tested before it is saved.",
   "aj.modelo": "Model",
@@ -224,5 +228,7 @@
   "error.clave_corta": "The password must have at least 8 characters.",
   "error.clave_mala": "Wrong password.",
   "error.sin_conexion": "Can't reach the panel.",
-  "error.no_coinciden": "The passwords don't match."
+  "error.no_coinciden": "The passwords don't match.",
+  "error.interno": "Something went wrong in the panel. Try again; if it keeps failing, check its log.",
+  "error.codigo_malo": "That is not the setup code. Check the panel's log."
 }

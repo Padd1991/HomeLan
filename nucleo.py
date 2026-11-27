@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from contextlib import closing
 
 DATOS = (os.environ.get("PANEL_DATOS") or os.environ.get("STATE_DIRECTORY")
@@ -13,7 +14,7 @@ RETENCION = 400 * 86400
 MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 TIPOS = ["red", "servidor", "ordenador", "movil", "casa", "otro"]
 MEDIOS = ["cable", "wifi", "virtual", ""]
-VERSION_ESQUEMA = 3
+VERSION_ESQUEMA = 4
 
 log = logging.getLogger("panel")
 
@@ -88,8 +89,8 @@ def mac_privada(mac):
 
 
 def punto_codigo(v):
-    """Convierte los nombres de punto de la primera version ('WiFi 5 GHz (red 2)') en codigos ('wifi5-2')."""
-    m = re.fullmatch(r"WiFi (5|2,4) GHz(?: \(red (\d)\))?", v or "")
+    """Convierte nombres de punto ('WiFi 5 GHz (red 2)', 'WiFi 2.4 GHz (network 3)') en codigos ('wifi5-2')."""
+    m = re.fullmatch(r"WiFi (5|2[,.]4) GHz(?: \((?:red|network) (\d)\))?", v or "")
     if not m:
         return v
     return ("wifi5" if m.group(1) == "5" else "wifi24") + (f"-{m.group(2)}" if m.group(2) else "")
@@ -148,6 +149,11 @@ def migrar(c):
             d = datos_de_texto(e["clase"], e["texto"])
             if d is not None:
                 c.execute("UPDATE eventos SET datos=?, texto='' WHERE id=?", (json.dumps(d), e["id"]))
+    if version < 4:
+        # La web guardaba la boca WiFi con su texto traducido al editar un equipo: vuelve a ser un codigo.
+        for (v,) in c.execute("SELECT DISTINCT boca FROM equipos WHERE boca LIKE 'WiFi %'").fetchall():
+            if punto_codigo(v) != v:
+                c.execute("UPDATE equipos SET boca=? WHERE boca=?", (punto_codigo(v), v))
     meta(c, "esquema", VERSION_ESQUEMA)
 
 
@@ -185,6 +191,28 @@ def preparar():
             os.chmod(BD + sufijo, 0o600)
         except OSError:
             pass
+
+
+def esperar_hora(carpeta="/run/systemd/timesync", maximo=120):
+    """Espera a que systemd-timesyncd ponga el reloj en hora, como mucho `maximo` segundos.
+
+    Una Raspberry Pi no tiene pila de reloj: arranca con la hora del ultimo apagado y salta al sincronizar,
+    y lo escaneado antes quedaria con horas falsas. Sin timesyncd (Docker, LXC, chrony) no se espera.
+    Devuelve True si el reloj esta en hora o no se sabe.
+    """
+    if not os.path.isdir(carpeta):
+        return True
+    fin = time.monotonic() + maximo
+    avisado = False
+    while not os.path.exists(os.path.join(carpeta, "synchronized")):
+        if time.monotonic() >= fin:
+            log.warning("el reloj sigue sin ponerse en hora: se empieza a escanear igual")
+            return False
+        if not avisado:
+            log.info("esperando a que el reloj se ponga en hora (como mucho %s s)", maximo)
+            avisado = True
+        time.sleep(min(2, maximo))
+    return True
 
 
 def padres_validos(c):

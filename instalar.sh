@@ -24,6 +24,8 @@ if [ "${1:-}" = "--desinstalar" ]; then
   rm -f "$UNIDAD"
   systemctl daemon-reload
   rm -rf "$DESTINO"
+  # Al reinstalar se crea de nuevo, y systemd vuelve a dar los datos al usuario nuevo.
+  userdel panelred 2>/dev/null || true
   if [ "${2:-}" = "--borrar-datos" ]; then
     rm -rf "$DATOS"
     echo "Panel desinstalado y datos borrados."
@@ -61,7 +63,8 @@ for f in $ARCHIVOS; do install -m 644 "$DIR/$f" "$DESTINO/$f"; done
 cat > "$UNIDAD" <<EOF
 [Unit]
 Description=HomeLan (panel de red / network panel)
-After=network-online.target
+# time-sync.target: con un servicio que espere a la hora de verdad, arranca despues (sin pila de reloj, la Pi arranca atrasada).
+After=network-online.target time-sync.target
 Wants=network-online.target
 
 [Service]
@@ -79,6 +82,22 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# AF_PACKET para arp-scan, AF_NETLINK para el comando ip
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_PACKET AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 MemoryMax=200M
 
 [Install]
@@ -97,6 +116,19 @@ for _ in $(seq 1 30); do
     [ "$PUERTO" = 80 ] || URL="$URL:$PUERTO"
     echo
     echo "Listo / Done: $URL"
+    # Sin contraseña aun: el panel pide este codigo para ponerla (solo sale en su registro).
+    CODIGO=""
+    if python3 -c "import urllib.request,json,sys; sys.exit(json.load(urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:$PUERTO/api/sesion', timeout=2))['configurado'])" 2>/dev/null; then
+      for _ in 1 2 3 4 5; do  # el registro puede tardar un instante en llegar al journal
+        CODIGO=$(journalctl -u panel-red -o cat -n 50 2>/dev/null | grep -o 'setup code: [A-Z0-9-]*' | tail -1 | cut -d' ' -f3 || true)
+        [ -n "$CODIGO" ] && break
+        sleep 1
+      done
+    fi
+    if [ -n "$CODIGO" ]; then
+      echo "Código para la primera vez / Setup code: $CODIGO"
+      echo "  (si lo pierdes / if you lose it: journalctl -u panel-red | grep 'setup code')"
+    fi
     exit 0
   fi
   sleep 1

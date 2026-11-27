@@ -1,10 +1,7 @@
 * text=auto eol=lf
 *.png binary
-# Fuera del paquete para compartir: herramientas de esta casa y de desarrollo
-desplegar.sh export-ignore
-backup-ct-nas.sh export-ignore
+# Fuera del paquete para compartir: herramientas de desarrollo
 empaquetar.sh export-ignore
-publicar.sh export-ignore
 .github export-ignore
 .gitignore export-ignore
 .gitattributes export-ignore
